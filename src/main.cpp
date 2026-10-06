@@ -3,6 +3,11 @@
 #include <pico.h>
 #include <hardware/flash.h>
 #include <hardware/vreg.h>
+#if PICO_RP2350
+#include <hardware/structs/qmi.h>
+#else
+#include <hardware/structs/vreg_and_chip_reset.h>
+#endif
 #include <hardware/watchdog.h>
 #include <pico/multicore.h>
 #include <pico/stdlib.h>
@@ -233,7 +238,7 @@ bool filebrowser_loadfile(const char pathname[256]) {
     FILINFO fileinfo;
     f_stat(pathname, &fileinfo);
     rom_size = fileinfo.fsize;
-    if (16384 - 64 << 10 < fileinfo.fsize) {
+    if (PICO_FLASH_SIZE_BYTES - FLASH_TARGET_OFFSET < fileinfo.fsize) {
         draw_text("ERROR: ROM too large! Canceled!!", window_x + 1, window_y + 2, 13, 1);
         sleep_ms(5000);
         return false;
@@ -497,9 +502,36 @@ typedef struct __attribute__((__packed__)) {
 uint16_t frequencies[] = { 378, 396, 404, 408, 412, 416, 420, 424, 432 };
 uint8_t frequency_index = 0;
 
-bool overclock() {
+#if PICO_RP2350
+/* RP2350 has no boot2 PICO_FLASH_SPI_CLKDIV: keep the QSPI flash clock
+   below ~88 MHz by programming the QMI divider for the new system clock. */
+static void __not_in_flash_func(flash_timings)() {
+    const int max_flash_freq = 88 * MHZ;
+    const int clock_hz = frequencies[frequency_index] * MHZ;
+    int divisor = (clock_hz + max_flash_freq - 1) / max_flash_freq;
+    if (divisor == 1 && clock_hz > 100000000) {
+        divisor = 2;
+    }
+    int rxdelay = divisor;
+    if (clock_hz / divisor > 100000000) {
+        rxdelay += 1;
+    }
+    qmi_hw->m[0].timing = 0x60007000 |
+                          rxdelay << QMI_M0_TIMING_RXDELAY_LSB |
+                          divisor << QMI_M0_TIMING_CLKDIV_LSB;
+}
+#endif
+
+bool __not_in_flash_func(overclock)() {
+#if PICO_RP2350
+    vreg_disable_voltage_limit();
+    vreg_set_voltage(VREG_VOLTAGE_1_60);
+    sleep_ms(33);
+    flash_timings();
+#else
     hw_set_bits(&vreg_and_chip_reset_hw->vreg, VREG_AND_CHIP_RESET_VREG_VSEL_BITS);
     sleep_ms(10);
+#endif
     return set_sys_clock_khz(frequencies[frequency_index] * KHZ, true);
 }
 
@@ -738,6 +770,7 @@ void menu() {
 void __time_critical_func(render_core)() {
     multicore_lockout_victim_init();
 
+    tuh_init(BOARD_TUH_RHPORT);
     ps2kbd.init_gpio();
     nespad_begin(clock_get_hz(clk_sys) / 1000, NES_GPIO_CLK, NES_GPIO_DATA, NES_GPIO_LAT);
 
@@ -771,8 +804,7 @@ void __time_critical_func(render_core)() {
 
         tick = time_us_64();
 
-        // tuh_task();
-        // hid_app_task();
+        tuh_task();
         tight_loop_contents();
     }
 

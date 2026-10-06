@@ -4,15 +4,23 @@ if(WIN32)
 else()
     set(USERHOME $ENV{HOME})
 endif()
-set(sdkVersion 2.1.1)
+set(sdkVersion 2.2.0)
 set(toolchainVersion 14_2_Rel1)
-set(picotoolVersion 2.1.1)
+set(picotoolVersion 2.2.0)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
-set(PICO_BOARD pico CACHE STRING "Board type")
+set(PICO_BOARD_HEADER_DIRS ${CMAKE_CURRENT_LIST_DIR}/boards)
+
+# Chip: rp2040 (Pico) or rp2350 (Pico 2)
+#set(PICO_PLATFORM "rp2040" CACHE STRING "Chip type")
+set(PICO_PLATFORM "rp2350" CACHE STRING "Chip type")
+
+# Board: murmulator (MURMULATOR 1.x) or olimex-pico-pc (Olimex RP2040-PICO-PC)
+#set(PICO_BOARD "murmulator" CACHE STRING "Board type")
+set(PICO_BOARD "olimex-pico-pc" CACHE STRING "Board type")
 
 cmake_minimum_required(VERSION 3.13)
 include(pico_sdk_import.cmake)
@@ -25,7 +33,7 @@ option(I2S_CS4334 "Enable I2S CS4334 sound" OFF)
 option(VGA "Enable VGA" OFF)
 option(TFT "Enable TFT display" OFF)
 option(ILI9341 "Enable TFT ILI9341 display" OFF)
-option(HDMI "Enable HDMI display" OFF)
+option(HDMI "Enable HDMI display" ON)
 option(TV "Enable TV composite output" OFF)
 option(SOFTTV "Enable TV soft composite output" OFF)
 
@@ -69,11 +77,28 @@ message(STATUS "")
 
 add_executable(${PROJECT_NAME} ${SRC})
 
-pico_define_boot_stage2(slower_boot2 ${PICO_DEFAULT_BOOT_STAGE2_FILE})
-target_compile_definitions(slower_boot2 PRIVATE PICO_FLASH_SPI_CLKDIV=4)
-pico_set_boot_stage2(${PROJECT_NAME} slower_boot2)
+if (${PICO_PLATFORM} MATCHES "rp2040")
+	pico_define_boot_stage2(slower_boot2 ${PICO_DEFAULT_BOOT_STAGE2_FILE})
+	target_compile_definitions(slower_boot2 PRIVATE PICO_FLASH_SPI_CLKDIV=4)
+	pico_set_boot_stage2(${PROJECT_NAME} slower_boot2)
+	if (${PICO_BOARD} MATCHES "olimex-pico-pc")
+		SET(BUILD_NAME "PCp1-${PROJECT_NAME}")
+	else()
+		SET(BUILD_NAME "m1p1-${PROJECT_NAME}")
+	endif()
+else()
+	if (${PICO_BOARD} MATCHES "olimex-pico-pc")
+		SET(BUILD_NAME "PCp2-${PROJECT_NAME}")
+	else()
+		SET(BUILD_NAME "m1p2-${PROJECT_NAME}")
+	endif()
+endif()
 
-pico_set_program_name(ngpc "ngpc emulator by xrip for MURMULATOR devboard")
+if (${PICO_BOARD} MATCHES "olimex-pico-pc")
+	pico_set_program_name(ngpc "ngpc emulator by xrip for Olimex RP2040-PICO-PC")
+else()
+	pico_set_program_name(ngpc "ngpc emulator by xrip for MURMULATOR devboard")
+endif()
 pico_set_program_version(ngpc "develop")
 
 target_include_directories(${PROJECT_NAME} PRIVATE src src/neopop)
@@ -142,38 +167,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 		tinyusb_host tinyusb_board
 )
 
+# Pins and flash size come from boards/${PICO_BOARD}.h
 target_compile_definitions(${PROJECT_NAME} PRIVATE
-		PICO_FLASH_SIZE_BYTES=16777216
-		# SDCARD
-		SDCARD_PIN_SPI0_CS=5
-		SDCARD_PIN_SPI0_SCK=2
-		SDCARD_PIN_SPI0_MOSI=3
-		SDCARD_PIN_SPI0_MISO=4
-
-		# PS2KBD
 		USE_PS2_KBD
-		PS2KBD_GPIO_FIRST=0
-
-		# NES Gamepad
 		USE_NESPAD
-		NES_GPIO_CLK=14
-		NES_GPIO_DATA=16
-		NES_GPIO_LAT=15
-
-		# VGA 8 pins starts from pin:
-		VGA_BASE_PIN=6
-
-		# HDMI 8 pins starts from pin:
-		HDMI_BASE_PIN=6
-
-		# TFT
-		TFT_CS_PIN=6
-		TFT_RST_PIN=8
-		TFT_LED_PIN=9
-		TFT_DC_PIN=10
-		TFT_DATA_PIN=12
-		TFT_CLK_PIN=13
-
 		SMS_SINGLE_FILE=1
 )
 pico_enable_stdio_usb(${PROJECT_NAME} 0)
