@@ -34,7 +34,8 @@ uint8_t * SCREEN = (uint8_t *)cfb;
 /* Sound: NeoPop's two SN76489-style chips + 8-bit DAC, mixed once per
    emulated frame in system_VBL() */
 #define AUDIO_FREQ 22050
-#define AUDIO_SAMPLES_PER_FRAME (AUDIO_FREQ / 60)
+#define AUDIO_SAMPLES_PER_FRAME_MAX (AUDIO_FREQ / 60 + 1)
+#define AUDIO_BLOCK 256          /* stereo samples per DMA block (~11.6 ms) */
 
 char __uninitialized_ram(filename[256]);
 static uint32_t __uninitialized_ram(rom_size) = 0;
@@ -51,14 +52,20 @@ typedef struct __attribute__((__packed__)) {
     uint8_t ghosting;
     uint8_t palette;
     uint8_t save_slot;
+    uint8_t audio_volume;   // 0 = mute, 1..4 = 25%, 50%, 100%, 200%
+    uint8_t audio_rate;     // 0 = 22 kHz, 1 = 11 kHz (sound emulated at half rate)
+    uint8_t frame_skip;     // 0 = auto, 1..4 = draw 1 of 1..4 frames
 } SETTINGS;
 
 SETTINGS settings = {
-        .version = 1,
+        .version = 2,
         .swap_ab = false,
         .aspect_ratio = false,
         .ghosting = 8,
         .save_slot = 0,
+        .audio_volume = 3,
+        .audio_rate = 0,
+        .frame_skip = 0,
 };
 
 struct input_bits_t {
@@ -186,9 +193,12 @@ uint64_t start_time;
 
 
 i2s_config_t i2s_config;
-static _u16 chip_samples[AUDIO_SAMPLES_PER_FRAME];
-static _u8 dac_samples[AUDIO_SAMPLES_PER_FRAME];
-static int16_t audio_samples[AUDIO_SAMPLES_PER_FRAME * 2];
+static _u16 chip_samples[AUDIO_SAMPLES_PER_FRAME_MAX];
+static _u8 dac_samples[AUDIO_SAMPLES_PER_FRAME_MAX];
+static int16_t audio_block[AUDIO_BLOCK * 2];
+static uint16_t audio_block_fill = 0;
+static volatile bool frame_done = false;
+static uint64_t next_frame_us = 0;      // 0: restart frame pacing
 
 
 typedef struct __attribute__((__packed__)) {
@@ -648,6 +658,10 @@ const MenuItem menu_items[] = {
         {"Swap AB <> BA: %s",     ARRAY, &settings.swap_ab,  nullptr, 1, {"NO ",       "YES"}},
         {},
         { "Ghosting pix: %i ", INT, &settings.ghosting, nullptr, 8 },
+        {},
+        { "Volume: %s", ARRAY, &settings.audio_volume, nullptr, 4, { "Mute", "25% ", "50% ", "100%", "200%" } },
+        { "Emulate sound: %s", ARRAY, &settings.audio_rate, nullptr, 1, { "22 kHz", "11 kHz" } },
+        { "Frame skip: %s", ARRAY, &settings.frame_skip, nullptr, 4, { "Auto ", "Off  ", "1 / 2", "1 / 3", "1 / 4" } },
 #if VGA
         { "Keep aspect ratio: %s",     ARRAY, &settings.aspect_ratio,  nullptr, 1, {"NO ",       "YES"}},
 #endif
@@ -822,6 +836,76 @@ void __time_critical_func(render_core)() {
 int frame, frame_cnt = 0;
 int frame_timer_start = 0;
 uint8_t system_frameskip_key = 1;
+
+/* One emulated frame of sound: AUDIO_FREQ/60 output samples (367/368).
+   With audio_rate = 1 the chips are emulated at 11025 Hz and every sample
+   is output twice.  The mono mix goes through a DC blocker (the chip output
+   is unipolar), gets the volume gain and is queued in AUDIO_BLOCK blocks. */
+static void ngpc_audio_frame() {
+    static uint32_t frac = 0;
+    static uint8_t rate_shift = 0;
+    static uint8_t phase = 0;
+    static int x_prev = 0, y_prev = 0;
+    static const uint8_t gain[] = { 0, 1, 2, 4, 8 };   // x/4
+
+    const uint8_t want_shift = settings.audio_rate ? 1 : 0;
+    if (want_shift != rate_shift) {
+        rate_shift = want_shift;
+        sound_set_rate(AUDIO_FREQ >> rate_shift);
+    }
+
+    frac += AUDIO_FREQ;
+    const int n = (int)(frac / 60);
+    frac %= 60;
+
+    int g = n;
+    if (rate_shift) g = (n + ((phase & 1) == 0 ? 1 : 0)) >> 1;
+    sound_update(chip_samples, g * 2);
+    dac_update(dac_samples, n);           // the DAC FIFO is always read at the output rate
+
+    const int vol = settings.audio_volume <= 4 ? gain[settings.audio_volume] : 4;
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (!rate_shift || (phase & 1) == 0) {
+            const int x = (int)chip_samples[k] + (((int)dac_samples[i] - 0x80) << 7);
+            y_prev = x - x_prev + ((y_prev * 255) >> 8);
+            x_prev = x;
+            k++;
+        }
+        phase++;
+        int out = (y_prev * vol) >> 2;
+        if (out > 32767) out = 32767;
+        if (out < -32768) out = -32768;
+        audio_block[audio_block_fill * 2] = audio_block[audio_block_fill * 2 + 1] = (int16_t)out;
+        if (++audio_block_fill == AUDIO_BLOCK) {
+            i2s_dma_write(&i2s_config, audio_block);
+            audio_block_fill = 0;
+        }
+    }
+}
+
+/* Called after every emulated frame: wait for the 60 Hz slot while feeding
+   the audio DMA; when late, draw fewer frames (Auto) or use the fixed skip. */
+static void pace_frame() {
+    const uint64_t now = time_us_64();
+    if (next_frame_us == 0 || now > next_frame_us + 100000)
+        next_frame_us = now;              // (re)start, or too far behind to catch up
+    next_frame_us += 16667;
+
+    const bool behind = now >= next_frame_us;
+    while (time_us_64() < next_frame_us)
+        i2s_dma_pump(&i2s_config);
+
+    if (settings.frame_skip == 0) {
+        if (behind) {
+            if (system_frameskip_key < 4) system_frameskip_key++;
+        } else if (system_frameskip_key > 1) {
+            system_frameskip_key--;
+        }
+    } else {
+        system_frameskip_key = settings.frame_skip;
+    }
+}
 extern "C" {
 void system_message(char *vaMessage, ...) {
 /*    va_list vl;
@@ -859,15 +943,8 @@ void system_VBL(void) {
     ram[0x6F82] = buttons;
     // frame drawn
 
-    /* One frame of sound. i2s_dma_write() waits for the previous frame's
-       DMA transfer, which also paces the emulation to 60 frames/s. */
-    sound_update(chip_samples, sizeof(chip_samples));
-    dac_update(dac_samples, sizeof(dac_samples));
-    for (int i = 0; i < AUDIO_SAMPLES_PER_FRAME; i++) {
-        const int sample = (chip_samples[i] >> 1) + (((int)dac_samples[i] - 0x80) << 6);
-        audio_samples[i * 2] = audio_samples[i * 2 + 1] = (int16_t)sample;
-    }
-    i2s_dma_write(&i2s_config, audio_samples);
+    ngpc_audio_frame();
+    frame_done = true;    // main loop paces the frame and picks the frame skip
 }
 
 BOOL system_io_state_read(char* filename, _u8* buffer, _u32 bufferLength) {
@@ -933,7 +1010,7 @@ int main() {
         gpio_put(PICO_DEFAULT_LED_PIN, false);
     }
 
-//    load_config();
+    load_config();
 
     system_colour = COLOURMODE_AUTO;
     language_english = true;
@@ -942,7 +1019,7 @@ int main() {
     sound_init(AUDIO_FREQ);
     i2s_config = i2s_get_default_config();
     i2s_config.sample_freq = AUDIO_FREQ;
-    i2s_config.dma_trans_count = AUDIO_SAMPLES_PER_FRAME;
+    i2s_config.dma_trans_count = AUDIO_BLOCK;
     i2s_volume(&i2s_config, 0);
     i2s_init(&i2s_config);
 
@@ -958,13 +1035,22 @@ int main() {
         rom_loaded();
         reset();
         start_time = time_us_64();
+        next_frame_us = 0;
 
+        uint32_t pump_counter = 0;
         while (!reboot) {
             // for(int x = 0; x <64; x++) graphics_set_palette(x, RGB888(bitmap.pal.color[x][0], bitmap.pal.color[x][1], bitmap.pal.color[x][2]));
             emulate();
+            if ((++pump_counter & 1023) == 0)
+                i2s_dma_pump(&i2s_config);   // keep the audio DMA fed while emulating
+            if (frame_done) {
+                frame_done = false;
+                pace_frame();
+            }
             //printf("\remulate");
             if ((gamepad1_bits.start && gamepad1_bits.select) || (keyboard_bits.start && keyboard_bits.select)) {
                 menu();
+                next_frame_us = 0;
             }
 
 
