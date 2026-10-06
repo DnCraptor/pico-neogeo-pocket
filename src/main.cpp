@@ -1,7 +1,9 @@
 #include <cstdio>
 #include <cstring>
+#include <pico.h>
 #include <hardware/flash.h>
-#include <hardware/structs/vreg_and_chip_reset.h>
+#include <hardware/vreg.h>
+#include <hardware/watchdog.h>
 #include <pico/multicore.h>
 #include <pico/stdlib.h>
 
@@ -67,28 +69,26 @@ static input_bits_t keyboard_bits = { false, false, false, false, false, false, 
 static input_bits_t gamepad1_bits = { false, false, false, false, false, false, false, false };
 static input_bits_t gamepad2_bits = { false, false, false, false, false, false, false, false };
 
-bool swap_ab = false;
-
 void nespad_tick() {
     nespad_read();
 
     uint8_t controls_state = 0;
 
     if (settings.swap_ab) {
-        gamepad1_bits.b = (nespad_state & DPAD_A) != 0;
-        gamepad1_bits.a = (nespad_state & DPAD_B) != 0;
+        gamepad1_bits.b = keyboard_bits.a || (nespad_state & DPAD_A) != 0;
+        gamepad1_bits.a = keyboard_bits.b || (nespad_state & DPAD_B) != 0;
     } else {
-        gamepad1_bits.a = (nespad_state & DPAD_A) != 0;
-        gamepad1_bits.b = (nespad_state & DPAD_B) != 0;
+        gamepad1_bits.a = keyboard_bits.a || (nespad_state & DPAD_A) != 0;
+        gamepad1_bits.b = keyboard_bits.b || (nespad_state & DPAD_B) != 0;
 
     }
 
-    gamepad1_bits.select = (nespad_state & DPAD_SELECT) != 0;
-    gamepad1_bits.start = (nespad_state & DPAD_START) != 0;
-    gamepad1_bits.up = (nespad_state & DPAD_UP) != 0;
-    gamepad1_bits.down = (nespad_state & DPAD_DOWN) != 0;
-    gamepad1_bits.left = (nespad_state & DPAD_LEFT) != 0;
-    gamepad1_bits.right = (nespad_state & DPAD_RIGHT) != 0;
+    gamepad1_bits.select = keyboard_bits.select || (nespad_state & DPAD_SELECT) != 0;
+    gamepad1_bits.start = keyboard_bits.start || (nespad_state & DPAD_START) != 0;
+    gamepad1_bits.up = keyboard_bits.up || (nespad_state & DPAD_UP) != 0;
+    gamepad1_bits.down = keyboard_bits.down || (nespad_state & DPAD_DOWN) != 0;
+    gamepad1_bits.left = keyboard_bits.left || (nespad_state & DPAD_LEFT) != 0;
+    gamepad1_bits.right = keyboard_bits.right || (nespad_state & DPAD_RIGHT) != 0;
 
 
     if (gamepad1_bits.up || keyboard_bits.up ) controls_state|=0x08;
@@ -112,6 +112,10 @@ static bool isInReport(hid_keyboard_report_t const* report, const unsigned char 
     return false;
 }
 
+volatile bool altPressed = false;
+volatile bool ctrlPressed = false;
+volatile uint8_t fxPressedV = 0;
+
 void
 __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid_keyboard_report_t const* prev_report) {
     /* printf("HID key report modifiers %2.2X report ", report->modifier);
@@ -119,16 +123,42 @@ __not_in_flash_func(process_kbd_report)(hid_keyboard_report_t const* report, hid
         printf("%2.2X", i);
     printf("\r\n");
      */
-    keyboard_bits.start = isInReport(report, HID_KEY_ENTER);
-    keyboard_bits.select = isInReport(report, HID_KEY_BACKSPACE) || isInReport(report, HID_KEY_ESCAPE);
+    keyboard_bits.start = isInReport(report, HID_KEY_ENTER) || isInReport(report, HID_KEY_KEYPAD_ENTER);
+    keyboard_bits.select = isInReport(report, HID_KEY_BACKSPACE) || isInReport(report, HID_KEY_ESCAPE) || isInReport(report, HID_KEY_KEYPAD_ADD);
+    keyboard_bits.a = isInReport(report, HID_KEY_Z) || isInReport(report, HID_KEY_O) || isInReport(report, HID_KEY_KEYPAD_0);
+    keyboard_bits.b = isInReport(report, HID_KEY_X) || isInReport(report, HID_KEY_P) || isInReport(report, HID_KEY_KEYPAD_DECIMAL);
 
-    keyboard_bits.a = isInReport(report, HID_KEY_Z) || isInReport(report, HID_KEY_O);
-    keyboard_bits.b = isInReport(report, HID_KEY_X) || isInReport(report, HID_KEY_P);
+    bool b7 = isInReport(report, HID_KEY_KEYPAD_7);
+    bool b9 = isInReport(report, HID_KEY_KEYPAD_9);
+    bool b1 = isInReport(report, HID_KEY_KEYPAD_1);
+    bool b3 = isInReport(report, HID_KEY_KEYPAD_3);
 
-    keyboard_bits.up = isInReport(report, HID_KEY_ARROW_UP) || isInReport(report, HID_KEY_W);
-    keyboard_bits.down = isInReport(report, HID_KEY_ARROW_DOWN) || isInReport(report, HID_KEY_S);
-    keyboard_bits.left = isInReport(report, HID_KEY_ARROW_LEFT) || isInReport(report, HID_KEY_A);
-    keyboard_bits.right = isInReport(report, HID_KEY_ARROW_RIGHT)  || isInReport(report, HID_KEY_D);
+    keyboard_bits.up = b7 || b9 || isInReport(report, HID_KEY_ARROW_UP) || isInReport(report, HID_KEY_W) || isInReport(report, HID_KEY_KEYPAD_8);
+    keyboard_bits.down = b1 || b3 || isInReport(report, HID_KEY_ARROW_DOWN) || isInReport(report, HID_KEY_S) || isInReport(report, HID_KEY_KEYPAD_2) || isInReport(report, HID_KEY_KEYPAD_5);
+    keyboard_bits.left = b7 || b1 || isInReport(report, HID_KEY_ARROW_LEFT) || isInReport(report, HID_KEY_A) || isInReport(report, HID_KEY_KEYPAD_4);
+    keyboard_bits.right = b9 || b3 || isInReport(report, HID_KEY_ARROW_RIGHT)  || isInReport(report, HID_KEY_D) || isInReport(report, HID_KEY_KEYPAD_6);
+
+    altPressed = isInReport(report, HID_KEY_ALT_LEFT) || isInReport(report, HID_KEY_ALT_RIGHT);
+    ctrlPressed = isInReport(report, HID_KEY_CONTROL_LEFT) || isInReport(report, HID_KEY_CONTROL_RIGHT);
+    
+    if (altPressed && ctrlPressed && isInReport(report, HID_KEY_DELETE)) {
+        watchdog_enable(10, true);
+        while(true) {
+            tight_loop_contents();
+        }
+    }
+    if (ctrlPressed || altPressed) {
+        uint8_t fxPressed = 0;
+        if (isInReport(report, HID_KEY_F1)) fxPressed = 1;
+        else if (isInReport(report, HID_KEY_F2)) fxPressed = 2;
+        else if (isInReport(report, HID_KEY_F3)) fxPressed = 3;
+        else if (isInReport(report, HID_KEY_F4)) fxPressed = 4;
+        else if (isInReport(report, HID_KEY_F5)) fxPressed = 5;
+        else if (isInReport(report, HID_KEY_F6)) fxPressed = 6;
+        else if (isInReport(report, HID_KEY_F7)) fxPressed = 7;
+        else if (isInReport(report, HID_KEY_F8)) fxPressed = 8;
+        fxPressedV = fxPressed;
+    }
     //-------------------------------------------------------------------------
 }
 
@@ -263,6 +293,7 @@ void filebrowser(const char pathname[256], const char executables[11]) {
         draw_text("SD Card not inserted or SD Card error!", 0, 0, 12, 0);
         while (true);
     }
+    f_mkdir(HOME_DIR);
 
     while (true) {
         memset(fileItems, 0, sizeof(file_item_t) * max_files);
@@ -547,6 +578,7 @@ void save_config() {
         f_close(&file);
     }
 }
+
 #if SOFTTV
 typedef struct tv_out_mode_t {
     // double color_freq;
@@ -828,7 +860,7 @@ char *
 system_get_string(STRINGS string_id)
 {
     if (string_id >= STRINGS_MAX)
-        return "Unknown String";
+        return (char*)"Unknown String";
 
     return string_tags[string_id].string;
 }
