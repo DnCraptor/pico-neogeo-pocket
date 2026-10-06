@@ -94,6 +94,21 @@ else()
 	endif()
 endif()
 
+# RP2350: run the NeoPop core (TLCS-900h, Z80, memory, graphics, sound) from
+# SRAM instead of XIP flash.  The cartridge itself is read through XIP, and
+# code fetches competing with it for the 16 KB XIP cache made the emulation
+# too slow.  The SDK linker script already keeps libgcc/libm in RAM through
+# EXCLUDE_FILE lists; neopop objects are added to them, so their .text and
+# .rodata fall through to the RAM-resident .data section.
+if (${PICO_PLATFORM} MATCHES "rp2350")
+	file(READ ${PICO_SDK_PATH}/src/rp2_common/pico_crt0/rp2350/memmap_default.ld NGPC_LDS)
+	string(REPLACE "EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:)"
+	               "EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a: *src/neopop/*.o)"
+	               NGPC_LDS "${NGPC_LDS}")
+	file(WRITE ${CMAKE_BINARY_DIR}/memmap_ngpc.ld "${NGPC_LDS}")
+	pico_set_linker_script(${PROJECT_NAME} ${CMAKE_BINARY_DIR}/memmap_ngpc.ld)
+endif()
+
 if (${PICO_BOARD} MATCHES "olimex-pico-pc")
 	pico_set_program_name(ngpc "ngpc emulator by xrip for Olimex RP2040-PICO-PC")
 else()

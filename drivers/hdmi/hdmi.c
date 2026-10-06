@@ -202,7 +202,9 @@ static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
     irq_inx++;
 
     dma_hw->ints0 = 1u << dma_chan_ctrl;
-    dma_channel_set_read_addr(dma_chan_ctrl, &DMA_BUF_ADDR[inx_buf_dma & 1], false);
+    /* plain register write: in a Debug build the SDK inline helper is not
+       inlined and would be a call into flash */
+    dma_hw->ch[dma_chan_ctrl].read_addr = (uintptr_t)&DMA_BUF_ADDR[inx_buf_dma & 1];
 
     line = line >= 524 ? 0 : line + 1;
 
