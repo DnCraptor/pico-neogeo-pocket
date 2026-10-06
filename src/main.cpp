@@ -31,8 +31,10 @@ static const uintptr_t romdata = XIP_BASE + FLASH_TARGET_OFFSET;
 extern uint16_t cfb[256*256];
 uint8_t * SCREEN = (uint8_t *)cfb;
 
-#define AUDIO_SAMPLE_RATE SV_SAMPLE_RATE
-#define AUDIO_BUFFER_SIZE ((SV_SAMPLE_RATE / 60) << 1)
+/* Sound: NeoPop's two SN76489-style chips + 8-bit DAC, mixed once per
+   emulated frame in system_VBL() */
+#define AUDIO_FREQ 22050
+#define AUDIO_SAMPLES_PER_FRAME (AUDIO_FREQ / 60)
 
 char __uninitialized_ram(filename[256]);
 static uint32_t __uninitialized_ram(rom_size) = 0;
@@ -184,7 +186,9 @@ uint64_t start_time;
 
 
 i2s_config_t i2s_config;
-#define AUDIO_FREQ SV_SAMPLE_RATE
+static _u16 chip_samples[AUDIO_SAMPLES_PER_FRAME];
+static _u8 dac_samples[AUDIO_SAMPLES_PER_FRAME];
+static int16_t audio_samples[AUDIO_SAMPLES_PER_FRAME * 2];
 
 
 typedef struct __attribute__((__packed__)) {
@@ -828,7 +832,7 @@ void system_message(char *vaMessage, ...) {
     printf("\n");*/
 }
 
-void system_sound_chipreset(void) {}
+void system_sound_chipreset(void) { sound_init(AUDIO_FREQ); }
 void system_sound_silence(void) {}
 BOOL system_comms_read(_u8* buffer) { return false; }
 BOOL system_comms_poll(_u8* buffer) { return false; }
@@ -854,6 +858,16 @@ void system_VBL(void) {
     if (gamepad1_bits.start || keyboard_bits.start) buttons |= 0x40;
     ram[0x6F82] = buttons;
     // frame drawn
+
+    /* One frame of sound. i2s_dma_write() waits for the previous frame's
+       DMA transfer, which also paces the emulation to 60 frames/s. */
+    sound_update(chip_samples, sizeof(chip_samples));
+    dac_update(dac_samples, sizeof(dac_samples));
+    for (int i = 0; i < AUDIO_SAMPLES_PER_FRAME; i++) {
+        const int sample = (chip_samples[i] >> 1) + (((int)dac_samples[i] - 0x80) << 6);
+        audio_samples[i * 2] = audio_samples[i * 2 + 1] = (int16_t)sample;
+    }
+    i2s_dma_write(&i2s_config, audio_samples);
 }
 
 BOOL system_io_state_read(char* filename, _u8* buffer, _u32 bufferLength) {
@@ -923,7 +937,14 @@ int main() {
 
     system_colour = COLOURMODE_AUTO;
     language_english = true;
-    mute = true;
+    mute = false;
+
+    sound_init(AUDIO_FREQ);
+    i2s_config = i2s_get_default_config();
+    i2s_config.sample_freq = AUDIO_FREQ;
+    i2s_config.dma_trans_count = AUDIO_SAMPLES_PER_FRAME;
+    i2s_volume(&i2s_config, 0);
+    i2s_init(&i2s_config);
 
     bios_install();
 

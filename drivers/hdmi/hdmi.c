@@ -171,6 +171,31 @@ static void pio_set_x(PIO pio, const int sm, uint32_t v) {
 }
 
 
+/* The DMA IRQ handler runs from SCRATCH_Y and must not touch flash: while the
+   emulator streams the cartridge through XIP, a flash access here stalls the
+   handler and the line is late.  So no memset()/memcpy() (on RP2350 they are
+   ordinary flash code, not ROM routines), and the font and text palette are
+   used from RAM copies. */
+static uint8_t font_6x8_ram[sizeof(font_6x8)];
+static uint8_t textmode_palette_ram[sizeof(textmode_palette)];
+
+/* no-tree-loop-distribute-patterns: keep GCC from turning the loop back
+   into a memset() call */
+static void __scratch_y("hdmi_fill") __attribute__((noinline, optimize("no-tree-loop-distribute-patterns")))
+hdmi_fill(uint8_t* dst, const uint8_t value, int count) {
+    while (count > 0 && ((uintptr_t)dst & 3)) {
+        *dst++ = value;
+        count--;
+    }
+    const uint32_t v4 = value * 0x01010101u;
+    while (count >= 4) {
+        *(uint32_t *)dst = v4;
+        dst += 4;
+        count -= 4;
+    }
+    while (count-- > 0) *dst++ = value;
+}
+
 static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
     static uint32_t inx_buf_dma;
     static uint line = 0;
@@ -206,13 +231,13 @@ static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
                 const int y0 = (SCREEN_HEIGHT - out_h) / 2;
 
                 if (y < y0 || y >= y0 + out_h) {
-                    memset(output_buffer, 255, SCREEN_WIDTH);
+                    hdmi_fill(output_buffer, 255, SCREEN_WIDTH);
                     break;
                 }
 
                 const uint16_t* in = (const uint16_t *)graphics_buffer +
-                                     ((y - y0) * 2 / 3) * graphics_buffer_width;
-                memset(output_buffer, 255, x0);
+                                     ((((unsigned)(y - y0) * 2u) * 21846u) >> 16) * graphics_buffer_width; /* x/3 without a division call (exact for x < 32768) */
+                hdmi_fill(output_buffer, 255, x0);
                 output_buffer += x0;
                 for (int x = 0; x < graphics_buffer_width; x += 2) {
                     const uint8_t c0 = ngpc_lut[in[x] & 0x0fff];
@@ -221,7 +246,7 @@ static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
                     *output_buffer++ = c0;
                     *output_buffer++ = c1;
                 }
-                memset(output_buffer, 255, SCREEN_WIDTH - x0 - out_w);
+                hdmi_fill(output_buffer, 255, SCREEN_WIDTH - x0 - out_w);
                 break;
             }
             case TEXTMODE_DEFAULT:
@@ -232,12 +257,12 @@ static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
                     const uint16_t offset = (y / 8) * (TEXTMODE_COLS * 2) + x * 2;
                     const uint8_t c = text_buffer[offset];
                     const uint8_t colorIndex = text_buffer[offset + 1];
-                    uint8_t glyph_row = font_6x8[c * 8 + y % 8];
+                    uint8_t glyph_row = font_6x8_ram[c * 8 + y % 8];
 
                     for (int bit = 6; bit--;) {
                         *output_buffer++ = glyph_row & 1
-                                               ? textmode_palette[colorIndex & 0xf] //цвет шрифта
-                                               : textmode_palette[colorIndex >> 4]; //цвет фона
+                                               ? textmode_palette_ram[colorIndex & 0xf] //цвет шрифта
+                                               : textmode_palette_ram[colorIndex >> 4]; //цвет фона
 
                         glyph_row >>= 1;
                     }
@@ -255,9 +280,9 @@ static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
 
         // --|_|---|_|---|_|----
         //---|___________|-----
-        memset(activ_buf + 48,BASE_HDMI_CTRL_INX, 24);
-        memset(activ_buf,BASE_HDMI_CTRL_INX + 1, 48);
-        memset(activ_buf + 392,BASE_HDMI_CTRL_INX, 8);
+        hdmi_fill(activ_buf + 48,BASE_HDMI_CTRL_INX, 24);
+        hdmi_fill(activ_buf,BASE_HDMI_CTRL_INX + 1, 48);
+        hdmi_fill(activ_buf + 392,BASE_HDMI_CTRL_INX, 8);
 
         //без выравнивания
         // --|_|---|_|---|_|----
@@ -271,8 +296,8 @@ static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
             //для выравнивания синхры
             // --|_|---|_|---|_|----
             //---|___________|-----
-            memset(activ_buf + 48,BASE_HDMI_CTRL_INX + 2, 352);
-            memset(activ_buf,BASE_HDMI_CTRL_INX + 3, 48);
+            hdmi_fill(activ_buf + 48,BASE_HDMI_CTRL_INX + 2, 352);
+            hdmi_fill(activ_buf,BASE_HDMI_CTRL_INX + 3, 48);
             //без выравнивания
             // --|_|---|_|---|_|----
             //-------|___________|----
@@ -284,8 +309,8 @@ static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
             //ССИ без изображения
             //для выравнивания синхры
 
-            memset(activ_buf + 48,BASE_HDMI_CTRL_INX, 352);
-            memset(activ_buf,BASE_HDMI_CTRL_INX + 1, 48);
+            hdmi_fill(activ_buf + 48,BASE_HDMI_CTRL_INX, 352);
+            hdmi_fill(activ_buf,BASE_HDMI_CTRL_INX + 1, 48);
 
             // memset(activ_buf,BASE_HDMI_CTRL_INX,328);
             // memset(activ_buf+328,BASE_HDMI_CTRL_INX+1,48);
@@ -553,6 +578,9 @@ void graphics_set_buffer(uint8_t* buffer, uint16_t width, uint16_t height) {
 
 //выделение и настройка общих ресурсов - 4 DMA канала, PIO программ и 2 SM
 void graphics_init() {
+    memcpy(font_6x8_ram, font_6x8, sizeof(font_6x8_ram));
+    memcpy(textmode_palette_ram, textmode_palette, sizeof(textmode_palette_ram));
+
     //настройка PIO
     SM_video = pio_claim_unused_sm(PIO_VIDEO, true);
     SM_conv = pio_claim_unused_sm(PIO_VIDEO_ADDR, true);
