@@ -23,6 +23,9 @@ static enum graphics_mode_t graphics_mode = GRAPHICSMODE_DEFAULT;
 //буфер  палитры 256 цветов в формате R8G8B8
 static uint32_t palette[256];
 
+/* NGPC 12-bit 0x0BGR colour -> palette index 0..199 (5 x 8 x 5 levels) */
+static uint8_t ngpc_lut[4096];
+
 
 #define SCREEN_WIDTH (320)
 #define SCREEN_HEIGHT (240)
@@ -193,33 +196,32 @@ static void __scratch_y("hdmi_driver") dma_handler_HDMI() {
         switch (graphics_mode) {
             case GRAPHICSMODE_DEFAULT:
             case VGA_320x240x256: {
-                //заполняем пространство сверху и снизу графического буфера
-                if (y <= graphics_buffer_shift_y || y >= (graphics_buffer_shift_y + graphics_buffer_height)) {
-                    memset(output_buffer, 255,SCREEN_WIDTH);
+                /* The NeoPop framebuffer holds 16-bit 0x0BGR pixels
+                   (graphics_buffer_width x graphics_buffer_height = 160 x 152).
+                   Scale it 3:2 to 240 x 228 and centre it in 320 x 240;
+                   colours go through ngpc_lut[] to palette entries 0..199. */
+                const int out_w = graphics_buffer_width * 3 / 2;
+                const int out_h = graphics_buffer_height * 3 / 2;
+                const int x0 = (SCREEN_WIDTH - out_w) / 2;
+                const int y0 = (SCREEN_HEIGHT - out_h) / 2;
+
+                if (y < y0 || y >= y0 + out_h) {
+                    memset(output_buffer, 255, SCREEN_WIDTH);
                     break;
                 }
 
-                uint8_t* activ_buf_end = output_buffer + SCREEN_WIDTH;
-                //рисуем пространство слева от буфера
-                memset(output_buffer, 255, graphics_buffer_shift_x);
-                output_buffer += graphics_buffer_shift_x;
-
-                //рисуем сам видеобуфер+пространство справа
-                input_buffer = &graphics_buffer[(y - graphics_buffer_shift_y) * graphics_buffer_width];
-
-                const uint8_t* input_buffer_end = input_buffer + graphics_buffer_width;
-
-                if (graphics_buffer_shift_x < 0) input_buffer -= graphics_buffer_shift_x;
-
-                while (activ_buf_end > output_buffer) {
-                    if (input_buffer < input_buffer_end) {
-                        uint8_t i_color = *input_buffer++ >> 6;
-                        i_color = ((i_color & 0xf0) == 0xf0) ? 255 : i_color;
-                        *output_buffer++ = i_color;
-                    } else
-                        *output_buffer++ = 255;
+                const uint16_t* in = (const uint16_t *)graphics_buffer +
+                                     ((y - y0) * 2 / 3) * graphics_buffer_width;
+                memset(output_buffer, 255, x0);
+                output_buffer += x0;
+                for (int x = 0; x < graphics_buffer_width; x += 2) {
+                    const uint8_t c0 = ngpc_lut[in[x] & 0x0fff];
+                    const uint8_t c1 = ngpc_lut[in[x + 1] & 0x0fff];
+                    *output_buffer++ = c0;
+                    *output_buffer++ = c0;
+                    *output_buffer++ = c1;
                 }
-
+                memset(output_buffer, 255, SCREEN_WIDTH - x0 - out_w);
                 break;
             }
             case TEXTMODE_DEFAULT:
@@ -560,6 +562,20 @@ void graphics_init() {
     dma_chan_pal_conv_ctrl = dma_claim_unused_channel(true);
     dma_chan_pal_conv = dma_claim_unused_channel(true);
 
+
+    /* Palette 0..199 for NeoPop pixels: R 5 levels, G 8 levels, B 5 levels
+       (200..215 are the text-mode colours, 240.. are HDMI control symbols). */
+    for (int r = 0; r < 5; r++)
+        for (int g = 0; g < 8; g++)
+            for (int b = 0; b < 5; b++)
+                graphics_set_palette((r * 8 + g) * 5 + b,
+                                     RGB888(r * 255 / 4, g * 255 / 7, b * 255 / 4));
+    for (int c = 0; c < 4096; c++) {
+        const int r = (c & 0x00f) * 5 / 16;
+        const int g = ((c >> 4) & 0x00f) >> 1;
+        const int b = ((c >> 8) & 0x00f) * 5 / 16;
+        ngpc_lut[c] = (uint8_t)((r * 8 + g) * 5 + b);
+    }
 
     // FIXME сделать конфигурацию пользователем
     graphics_set_palette(200, RGB888(0x00, 0x00, 0x00)); //black
