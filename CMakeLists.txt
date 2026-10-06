@@ -101,11 +101,19 @@ endif()
 # EXCLUDE_FILE lists; neopop objects are added to them, so their .text and
 # .rodata fall through to the RAM-resident .data section.
 if (${PICO_PLATFORM} MATCHES "rp2350")
+	# The pattern must match object names on every host: Windows builds give
+	# "CMakeFiles\ngpc.dir\src\neopop\mem.c.obj", Linux ".../src/neopop/mem.c.o".
 	file(READ ${PICO_SDK_PATH}/src/rp2_common/pico_crt0/rp2350/memmap_default.ld NGPC_LDS)
-	string(REPLACE "EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:)"
-	               "EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a: *src/neopop/*.o)"
+	set(NGPC_LDS_EXCLUDE "EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a:)")
+	string(FIND "${NGPC_LDS}" "${NGPC_LDS_EXCLUDE}" NGPC_LDS_POS)
+	if (NGPC_LDS_POS EQUAL -1)
+		message(FATAL_ERROR "memmap_default.ld of this pico-sdk has no '${NGPC_LDS_EXCLUDE}': cannot move the NeoPop core to RAM")
+	endif()
+	string(REPLACE "${NGPC_LDS_EXCLUDE}"
+	               "EXCLUDE_FILE(*libgcc.a: *libc.a:*lib_a-mem*.o *libm.a: *neopop*)"
 	               NGPC_LDS "${NGPC_LDS}")
 	file(WRITE ${CMAKE_BINARY_DIR}/memmap_ngpc.ld "${NGPC_LDS}")
+	message(STATUS "NeoPop core runs from RAM: ${CMAKE_BINARY_DIR}/memmap_ngpc.ld")
 	pico_set_linker_script(${PROJECT_NAME} ${CMAKE_BINARY_DIR}/memmap_ngpc.ld)
 endif()
 
